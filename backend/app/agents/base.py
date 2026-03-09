@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, AsyncGenerator
 from pydantic import BaseModel, Field
 
 class AgentResponse(BaseModel):
@@ -26,6 +26,6 @@ class BaseAgent(ABC):
         pass
 
     @abstractmethod
-    async def process(self, query: str, history: List[Dict[str, str]]) -> AgentResponse:
-        """The core execution logic of the sub-agent."""
+    async def process_stream(self, query: str, history: List[Dict[str, str]]) -> AsyncGenerator[str, None]:
+        """The core execution logic of the sub-agent, yielding tokens."""
         pass

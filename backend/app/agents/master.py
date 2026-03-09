@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, AsyncGenerator
 from litellm import completion
 from app.agents.base import BaseAgent, AgentResponse
 from app.core.config import settings
@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 class MasterAgent:
     """
     The orchestrator that analyzes intent and routes tasks to specialized agents.
-    It now incorporates RAG context and persistent memory.
+    Supports streaming token generation.
     """
     def __init__(self, sub_agents: List[BaseAgent]):
         self.sub_agents = {agent.name: agent for agent in sub_agents}
@@ -31,14 +31,13 @@ class MasterAgent:
             f"{agent_descriptions}\n\n"
             "ROUTING RULES:\n"
             "1. If the query clearly matches an expert's domain, route to that agent.\n"
-            "2. If the query is a simple greeting or general chat, answer directly as 'master'.\n"
-            "3. Use the 'context' and 'history' to inform your routing decision.\n\n"
+            "2. If the query is a simple greeting or general chat, answer directly as 'master'.\n\n"
             "RESPONSE FORMAT (MUST BE JSON):\n"
             '{ "next_agent": "agent_name_or_master", "reasoning": "why you chose this agent" }'
         )
 
-    async def route_and_process(self, query: str, session_id: str) -> AgentResponse:
-        """Route the query using history and RAG context."""
+    async def route_and_process_stream(self, query: str, session_id: str) -> AsyncGenerator[str, None]:
+        """Route and yield a stream of tokens."""
         try:
             # 1. Fetch History and RAG Context
             history = MemoryManager.get_history(session_id)
@@ -48,7 +47,7 @@ class MasterAgent:
             # Store user message
             MemoryManager.add_message(session_id, "user", query)
 
-            # 2. LLM Routing Decision
+            # 2. LLM Routing Decision (Not streamed for reliability)
             response = completion(
                 model=settings.DEFAULT_MODEL,
                 messages=[
@@ -61,29 +60,35 @@ class MasterAgent:
             
             decision = json.loads(response.choices[0].message.content)
             target_agent_name = decision.get("next_agent", "master")
+            
+            full_content = ""
+            source_agent = target_agent_name
 
             # 3. Delegation or Direct Answer
             if target_agent_name in self.sub_agents and target_agent_name != "master":
                 agent = self.sub_agents[target_agent_name]
-                agent_res = await agent.process(query, history)
+                async for token in agent.process_stream(query, history):
+                    full_content += token
+                    yield token
             else:
-                master_res = completion(
+                master_stream = completion(
                     model=settings.DEFAULT_MODEL,
                     messages=[
                         {"role": "system", "content": "You are the Master Agent. Answer using the context and history."},
                         *history,
                         {"role": "user", "content": f"Context: {context_str}\nQuery: {query}"}
-                    ]
+                    ],
+                    stream=True
                 )
-                agent_res = AgentResponse(
-                    content=master_res.choices[0].message.content,
-                    source_agent="master"
-                )
+                for chunk in master_stream:
+                    token = chunk.choices[0].delta.content
+                    if token:
+                        full_content += token
+                        yield token
 
             # Store assistant response
-            MemoryManager.add_message(session_id, "assistant", agent_res.content, agent_res.source_agent)
-            return agent_res
+            MemoryManager.add_message(session_id, "assistant", full_content, source_agent)
 
         except Exception as e:
             logger.error(f"Routing error: {e}")
-            return AgentResponse(content=f"Error: {str(e)}", source_agent="master")
+            yield f"Error: {str(e)}"
