@@ -33,6 +33,7 @@ def on_startup():
 class ChatRequest(BaseModel):
     query: str
     session_id: str = "default-session"
+    image_b64: Optional[str] = None # Base64 encoded image string
 
 @app.get("/")
 async def root():
@@ -41,10 +42,10 @@ async def root():
 @app.post(f"{settings.API_V1_STR}/chat")
 async def chat(request: ChatRequest):
     """
-    Stateful streaming chat endpoint.
+    Stateful streaming chat endpoint with Multi-Modal support.
     """
     return StreamingResponse(
-        master.route_and_process_stream(request.query, request.session_id),
+        master.route_and_process_stream(request.query, request.session_id, request.image_b64),
         media_type="text/event-stream"
     )
 

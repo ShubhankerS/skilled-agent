@@ -1,18 +1,19 @@
 import json
 import logging
+import base64
 from typing import List, Dict, Optional, AsyncGenerator
 from litellm import completion
 from app.agents.base import BaseAgent, AgentResponse
 from app.core.config import settings
 from app.services.memory import MemoryManager
 from app.services.rag import RAGPipeline
+from app.tools.web_search import WebSearchTool
 
 logger = logging.getLogger(__name__)
 
 class MasterAgent:
     """
-    The orchestrator that analyzes intent and routes tasks to specialized agents.
-    Supports streaming token generation.
+    Orchestrator with Multi-Modal, RAG, and Tool Execution capabilities.
     """
     def __init__(self, sub_agents: List[BaseAgent]):
         self.sub_agents = {agent.name: agent for agent in sub_agents}
@@ -20,74 +21,66 @@ class MasterAgent:
         self.system_prompt = self._generate_routing_prompt()
 
     def _generate_routing_prompt(self) -> str:
-        """Dynamically generates the prompt based on registered agents."""
-        agent_descriptions = "\n".join(
-            [f"- {a.name}: {a.description}" for a in self.sub_agents.values()]
-        )
+        agent_descriptions = "\n".join([f"- {a.name}: {a.description}" for a in self.sub_agents.values()])
         return (
-            "You are the Master Orchestrator for an AI Agent Stack.\n"
-            "Your job is to analyze the user's query, history, and provided context to decide which expert agent to route it to.\n\n"
-            "AVAILABLE EXPERTS:\n"
-            f"{agent_descriptions}\n\n"
+            "You are the Master Orchestrator with vision and web search abilities.\n"
+            f"AVAILABLE EXPERTS:\n{agent_descriptions}\n\n"
             "ROUTING RULES:\n"
-            "1. If the query clearly matches an expert's domain, route to that agent.\n"
-            "2. If the query is a simple greeting or general chat, answer directly as 'master'.\n\n"
-            "RESPONSE FORMAT (MUST BE JSON):\n"
-            '{ "next_agent": "agent_name_or_master", "reasoning": "why you chose this agent" }'
+            "1. Route based on domain expert description.\n"
+            "2. If real-time info is needed, include 'WEB_SEARCH' in your 'tools_to_use' field.\n"
+            "3. If an image is provided, analyze it first.\n"
+            "RESPONSE FORMAT (JSON):\n"
+            '{ "next_agent": "expert_name", "tools_to_use": ["WEB_SEARCH"], "reasoning": "..." }'
         )
 
-    async def route_and_process_stream(self, query: str, session_id: str) -> AsyncGenerator[str, None]:
-        """Route and yield a stream of tokens."""
+    async def route_and_process_stream(self, query: str, session_id: str, image_b64: Optional[str] = None) -> AsyncGenerator[str, None]:
         try:
-            # 1. Fetch History and RAG Context
             history = MemoryManager.get_history(session_id)
             context = await self.rag.query(query)
-            context_str = json.dumps(context)
+            
+            # Step 1: Handle Multi-Modal Message
+            user_content = [{"type": "text", "text": query}]
+            if image_b64:
+                user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}})
 
-            # Store user message
-            MemoryManager.add_message(session_id, "user", query)
-
-            # 2. LLM Routing Decision (Not streamed for reliability)
+            # Step 2: Routing Decision
             response = completion(
                 model=settings.DEFAULT_MODEL,
                 messages=[
-                    {"role": "system", "content": f"{self.system_prompt}\n\nCONTEXT:\n{context_str}"},
+                    {"role": "system", "content": f"{self.system_prompt}\n\nRAG Context: {json.dumps(context)}"},
                     *history,
-                    {"role": "user", "content": query}
+                    {"role": "user", "content": user_content}
                 ],
                 response_format={"type": "json_object"}
             )
             
             decision = json.loads(response.choices[0].message.content)
-            target_agent_name = decision.get("next_agent", "master")
-            
-            full_content = ""
-            source_agent = target_agent_name
+            target_agent = decision.get("next_agent", "master")
+            tools = decision.get("tools_to_use", [])
 
-            # 3. Delegation or Direct Answer
-            if target_agent_name in self.sub_agents and target_agent_name != "master":
-                agent = self.sub_agents[target_agent_name]
-                async for token in agent.process_stream(query, history):
+            # Step 3: Tool Execution (Web Search)
+            search_context = ""
+            if "WEB_SEARCH" in tools:
+                yield "🔍 Searching the web...\n\n"
+                results = WebSearchTool.search(query)
+                search_context = f"\nWeb Results: {json.dumps(results)}"
+
+            # Step 4: Final Processing
+            full_content = ""
+            messages = [
+                {"role": "system", "content": f"You are the {target_agent}. {search_context}\nContext: {json.dumps(context)}"},
+                *history,
+                {"role": "user", "content": user_content}
+            ]
+
+            async_res = completion(model=settings.DEFAULT_MODEL, messages=messages, stream=True)
+            for chunk in async_res:
+                token = chunk.choices[0].delta.content
+                if token:
                     full_content += token
                     yield token
-            else:
-                master_stream = completion(
-                    model=settings.DEFAULT_MODEL,
-                    messages=[
-                        {"role": "system", "content": "You are the Master Agent. Answer using the context and history."},
-                        *history,
-                        {"role": "user", "content": f"Context: {context_str}\nQuery: {query}"}
-                    ],
-                    stream=True
-                )
-                for chunk in master_stream:
-                    token = chunk.choices[0].delta.content
-                    if token:
-                        full_content += token
-                        yield token
 
-            # Store assistant response
-            MemoryManager.add_message(session_id, "assistant", full_content, source_agent)
+            MemoryManager.add_message(session_id, "assistant", full_content, target_agent)
 
         except Exception as e:
             logger.error(f"Routing error: {e}")
