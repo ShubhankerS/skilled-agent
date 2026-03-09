@@ -2,10 +2,35 @@
 
 A modular, scalable, and open-source-ready AI agent stack using FastAPI, Next.js, and LiteLLM.
 
-## Architecture
+## 🏗 System Architecture
+
+```mermaid
+graph TD
+    User((User)) -->|Query + Image| Frontend[Next.js Frontend]
+    Frontend -->|Streaming API| Backend[FastAPI Backend]
+    
+    subgraph "Orchestration Layer"
+        Backend --> Master[Master Agent / Router]
+        Master -->|1. Fetch History| Memory[(PostgreSQL Memory)]
+        Master -->|2. Search Context| RAG[(Qdrant Vector DB)]
+        Master -->|3. Decide Intent| LLM[Gemini 2.0 Flash]
+    end
+
+    subgraph "Execution Layer"
+        Master -->|Route to Expert| Researcher[Researcher Agent]
+        Master -->|Execute Tool| Search[Web Search Tool]
+        Researcher -->|Return Data| Master
+        Search -->|Return Results| Master
+    end
+
+    Master -->|4. Stream Response| User
+```
+
+## Architecture Key Features
 - **Router Pattern:** A central `MasterAgent` evaluates intent and delegates to specialized experts.
+- **Multi-Modal:** Support for text and image-based queries out of the box.
 - **LLM Agnostic:** Uses `LiteLLM` to support 100+ models (Gemini, OpenAI, Anthropic, etc.).
-- **Modularity:** High-separation of concerns for sub-agents.
+- **Modularity:** High-separation of concerns for sub-agents and tools.
 
 ---
 
