@@ -160,3 +160,9 @@ out/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Claude Code local settings and memory (personal, not project-wide)
+.claude/
+
+# SQLite test databases
+*.db
