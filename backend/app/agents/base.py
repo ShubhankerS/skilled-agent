@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, AsyncGenerator
+import json
 from pydantic import BaseModel, Field
 
 class AgentResponse(BaseModel):
@@ -26,6 +27,20 @@ class BaseAgent(ABC):
         pass
 
     @abstractmethod
-    async def process_stream(self, query: str, history: List[Dict[str, str]]) -> AsyncGenerator[str, None]:
-        """The core execution logic of the sub-agent, yielding tokens."""
+    async def process_stream(
+        self,
+        query: str,
+        history: List[Dict[str, str]],
+        context: Optional[List[Dict]] = None,
+        search_context: str = "",
+    ) -> AsyncGenerator[str, None]:
+        """
+        The core execution logic of the sub-agent, yielding tokens.
+
+        Args:
+            query:          The user's current message.
+            history:        Previous conversation turns from memory.
+            context:        RAG-retrieved document chunks from Qdrant.
+            search_context: Formatted web search results string (empty if not searched).
+        """
         pass
