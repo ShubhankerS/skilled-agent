@@ -1,20 +1,20 @@
 import asyncio
 import json
 import logging
+import time
 from typing import List, Dict, Optional, AsyncGenerator
 
 from litellm import acompletion
 from app.agents.base import BaseAgent, AgentResponse
 from app.core.config import settings
 from app.core.reliability import TokenBudget, TIMEOUT_LLM_ROUTING, TIMEOUT_WEB_SEARCH
+from app.core.audit import write_audit_record
 from app.services.memory import MemoryManager
 from app.services.rag import RAGPipeline
 from app.tools.web_search import WebSearchTool
 
 logger = logging.getLogger(__name__)
 
-# One shared token budget instance for the routing call.
-# The response call budget lives in each sub-agent.
 _routing_budget = TokenBudget(model=settings.DEFAULT_MODEL)
 
 
@@ -50,9 +50,20 @@ class MasterAgent:
         session_id: str,
         image_b64: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
+        start_time = time.monotonic()
+        tools_used: List[str] = []
+        actual_agent_name = "unknown"
+        rag_sources: List[Dict] = []
+        status = "ok"
+
         try:
             history = MemoryManager.get_history(session_id)
             context = await self.rag.query(query)
+
+            # Extract RAG source metadata for audit trail and citation tracking.
+            # Each context item is the payload dict stored at upload time,
+            # typically {"source": "filename.pdf", "chunk": 2, ...}
+            rag_sources = [c for c in context if c]
 
             # Step 1: Build the user message (text + optional image)
             user_content = [{"type": "text", "text": query}]
@@ -63,16 +74,12 @@ class MasterAgent:
                 })
 
             # Step 2: Routing decision
-            # Enforce token budget before the call so we never exceed the context window.
             routing_messages = _routing_budget.enforce([
                 {"role": "system", "content": f"{self.system_prompt}\n\nRAG Context: {json.dumps(context)}"},
                 *history,
                 {"role": "user", "content": user_content},
             ])
 
-            # acompletion is LiteLLM's async version — doesn't block the event loop.
-            # asyncio.wait_for enforces a hard timeout: if Gemini takes >15s to
-            # return the routing JSON, we raise TimeoutError instead of hanging.
             routing_response = await asyncio.wait_for(
                 acompletion(
                     model=settings.DEFAULT_MODEL,
@@ -84,27 +91,37 @@ class MasterAgent:
 
             decision = json.loads(routing_response.choices[0].message.content)
             target_agent = decision.get("next_agent", "master")
-            tools = decision.get("tools_to_use", [])
-            logger.info(f"Routing decision: agent={target_agent}, tools={tools}")
+            tools_used = decision.get("tools_to_use", [])
+
+            # Structured log — fields appear as top-level keys in JSON output
+            logger.info(
+                "routing_decision",
+                extra={
+                    "session_id": session_id,
+                    "agent": target_agent,
+                    "tools": tools_used,
+                    "rag_source_count": len(rag_sources),
+                },
+            )
 
             # Step 3: Tool execution (web search)
             search_context = ""
-            if "WEB_SEARCH" in tools:
+            if "WEB_SEARCH" in tools_used:
                 yield "🔍 Searching the web...\n\n"
                 try:
-                    # Web search is synchronous; run it in a thread so it doesn't
-                    # block the async event loop, with its own timeout.
                     results = await asyncio.wait_for(
                         asyncio.to_thread(WebSearchTool.search, query),
                         timeout=TIMEOUT_WEB_SEARCH,
                     )
                     search_context = f"\nWeb Results: {json.dumps(results)}"
                 except asyncio.TimeoutError:
-                    logger.warning("Web search timed out — proceeding without results")
+                    logger.warning(
+                        "web_search_timeout",
+                        extra={"session_id": session_id},
+                    )
                     search_context = ""
 
             # Step 4: Delegate to the actual sub-agent
-            # If the LLM returns an agent name we don't have, fall back gracefully.
             agent = self.sub_agents.get(target_agent) or next(iter(self.sub_agents.values()))
             actual_agent_name = agent.name
 
@@ -121,8 +138,32 @@ class MasterAgent:
             MemoryManager.add_message(session_id, "assistant", full_content, actual_agent_name)
 
         except asyncio.TimeoutError:
-            logger.error("LLM routing call timed out")
+            status = "timeout"
+            logger.error("routing_timeout", extra={"session_id": session_id})
             yield "The request timed out. Please try again."
         except Exception as e:
-            logger.error(f"Routing error: {e}", exc_info=True)
+            status = "error"
+            logger.error("routing_error", extra={"session_id": session_id, "error": str(e)}, exc_info=True)
             yield "I encountered an error processing your request. Please try again."
+        finally:
+            # Always write the audit record — even on error or timeout.
+            # "finally" runs whether the try block succeeded or raised.
+            duration_ms = int((time.monotonic() - start_time) * 1000)
+            write_audit_record(
+                session_id=session_id,
+                query=query,
+                agent=actual_agent_name,
+                tools_used=tools_used,
+                rag_sources=rag_sources,
+                duration_ms=duration_ms,
+                status=status,
+            )
+            logger.info(
+                "request_complete",
+                extra={
+                    "session_id": session_id,
+                    "agent": actual_agent_name,
+                    "duration_ms": duration_ms,
+                    "status": status,
+                },
+            )

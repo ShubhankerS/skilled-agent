@@ -9,14 +9,17 @@ from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from app.core.config import settings
+from app.core.logging_config import setup_logging
 from app.core.security import InputValidator, rate_limiter
 from app.agents.master import MasterAgent
 from app.agents.registry import get_registered_agents
 from app.agents.base import AgentResponse
 from app.models.memory import init_db
 
-# Initialize Logging
-logging.basicConfig(level=logging.INFO)
+# Install structured JSON logging before anything else logs.
+# From this point on, every logger.info/warning/error in the entire app
+# emits a JSON object instead of a plain text string.
+setup_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
